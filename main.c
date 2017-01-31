@@ -16,10 +16,7 @@ repeat:
 
 	if (result == CPARSE_RESULT_OK)
 	{
-		for (struct cparse_node_decl* decl = unit->decls; decl; decl = decl->next)
-		{
-			printf("declaration: %s\n", decl->spelling);
-		}
+		cparse_unit_dump(unit, stdout);
 	}
 	else if (result == CPARSE_RESULT_OUT_OF_MEMORY)
 	{

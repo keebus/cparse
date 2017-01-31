@@ -26,10 +26,15 @@ enum cparse_result {
 };
 
 enum cparse_type_kind {
-	CPARSE_TYPE_PRIMITIVE
+	CPARSE_TYPE_PRIMITIVE,
+	CPARSE_TYPE_POINTER,
+	CPARSE_TYPE_ARRAY,
+	CPARSE_TYPE_STRUCT,
+	CPARSE_TYPE_ENUM,
 };
 
-enum cparse_primitive_type_kind {
+enum cparse_type_primitive_kind {
+	CPARSE_PRIMITIVE_TYPE_CHAR,
 	CPARSE_PRIMITIVE_TYPE_SIGNED_CHAR,
 	CPARSE_PRIMITIVE_TYPE_UNSIGNED_CHAR,
 	CPARSE_PRIMITIVE_TYPE_SIGNED_SHORT,
@@ -46,42 +51,66 @@ enum cparse_primitive_type_kind {
 	CPARSE_PRIMITIVE_TYPE_COUNT_,
 };
 
+enum cparse_decl_kind {
+	CPARSE_DECL_VARIABLE,
+	CPARSE_DECL_FIELD,
+	CPARSE_DECL_STRUCT,
+};
+
 struct cparse_type {
 	enum cparse_type_kind kind;
-	const char* spelling;
 };
 
-struct cparse_primitive_type {
+struct cparse_type_primitive {
 	struct cparse_type type;
-	enum cparse_primitive_type_kind primitive_kind;
+	enum cparse_type_primitive_kind kind;
 };
 
-enum cparse_node_type {
-	CPARSE_NODE_TYPE_REF,
-	CPARSE_NODE_DECL_STRUCT,
+struct cparse_type_pointer {
+	struct cparse_type type;
+	struct cparse_type* pointee_type;
 };
 
-struct cparse_node {
-	enum cparse_node_type type;
+struct cparse_type_array {
+	struct cparse_type type;
+	struct cparse_type* element_type;
+	int extent;
 };
 
-struct cparse_node_type_ref {
-	struct cparse_node node;
-	struct cparse_node* type;
+struct cparse_type_struct {
+	struct cparse_type type;
+	struct cparse_decl_struct* struct_type;
 };
 
-struct cparse_node_decl {
-	struct cparse_node node;
-	struct cparse_node_decl* next;
+struct cparse_type_enum {
+	struct cparse_type type;
+	struct cparse_decl_enum* enum_type;
+};
+
+struct cparse_decl {
+	enum cparse_decl_kind kind;
+	struct cparse_decl* next;
 	const char* spelling;
 };
 
-struct cparse_node_decl_struct {
-	struct cparse_node_decl decl;
+struct cparse_decl_variable {
+	struct cparse_decl decl;
+	struct cparse_type* type;
+	const char* spelling;
+};
+
+struct cparse_decl_variable_field {
+	struct cparse_decl_variable variable;
+	int offset;
+};
+
+struct cparse_decl_struct {
+	struct cparse_decl decl;
+	struct cparse_decl_variable_field* fields;
 };
 
 struct cparse_unit {
-	struct cparse_node_decl* decls;
+	struct cparse_decl* decls;
 };
 
 struct cparse_info {
@@ -92,6 +121,13 @@ struct cparse_info {
 };
 
 CPARSE_API enum cparse_result cparse_file(const char* filename, struct cparse_info const*, struct cparse_unit** out);
+
+#ifndef CPARSE_NO_DUMP
+#include <stdio.h>
+
+CPARSE_API void cparse_unit_dump(struct cparse_unit*, FILE* output);
+
+#endif // CPARSE_NO_DUMP
 
 #endif CPARSE_H_
 
@@ -106,13 +142,12 @@ CPARSE_API enum cparse_result cparse_file(const char* filename, struct cparse_in
 #define uint unsigned int
 #endif
 
-#define _CRT_SECURE_NO_WARNINGS 0
-
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 static int cparse_min(int a, int b) { return a < b ? a : b;}
 
@@ -174,8 +209,7 @@ static const char* cparse_strtok(cparse_token_t tok)
 #undef CPARSE_MAKE_TOKEN_STR
 #undef CPARSE_TOKENS
 
-struct cparse_lexer
-{
+struct cparse_lexer {
 	FILE* file;
 	const char* filename;
 	uint line;
@@ -187,41 +221,15 @@ struct cparse_lexer
 	int curr;
 };
 
-struct cparse_state
-{
+struct cparse_state {
+	struct cparse_context* context;
 	jmp_buf error_handler;
 	char* alloc_begin;
 	char* alloc_end;
 	char* alloc_cursor;
 	char const* error;
 	struct cparse_lexer lex;
-
-	/* primitive types */
-	struct cparse_primitive_type types[CPARSE_PRIMITIVE_TYPE_COUNT_];
 };
-
-static void cparse_state_init_types(struct cparse_state* s)
-{
-	#define CPARSE_SET_PRIMITIVE_TYPE(id, spelling_)\
-		s->types[CPARSE_PRIMITIVE_TYPE_##id].type.kind = CPARSE_TYPE_PRIMITIVE;\
-		s->types[CPARSE_PRIMITIVE_TYPE_##id].type.spelling = spelling_;\
-		s->types[CPARSE_PRIMITIVE_TYPE_##id].primitive_kind = CPARSE_PRIMITIVE_TYPE_##id
-
-	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_CHAR, "signed char");
-	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_CHAR, "unsigned char");
-	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_SHORT, "signed short");
-	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_SHORT, "unsigned short");
-	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_INT, "signed int");
-	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_INT, "unsigned int");
-	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_LONG, "signed long");
-	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_LONG, "unsigned long");
-	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_LONG_LONG, "signed long long");
-	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_LONG_LONG, "unsigned long long");
-	CPARSE_SET_PRIMITIVE_TYPE(FLOAT, "float");
-	CPARSE_SET_PRIMITIVE_TYPE(DOUBLE, "double");
-
-	#undef CPARSE_SET_PRIMITIVE_TYPE
-}
 
 static size_t cparse_formatv(char* buffer, size_t buffer_size, const char* format, va_list args)
 {
@@ -396,6 +404,8 @@ static cparse_token_t cparse_lex(struct cparse_state* s)
 	l->lookahead = CPARSE_TOK_EOF;
 	l->token_size = 0;
 
+	bool floating = false;
+
 	for (;;) {
 		switch (l->curr)
 		{
@@ -406,12 +416,30 @@ static cparse_token_t cparse_lex(struct cparse_state* s)
 				cparse_lex_skip(s);
 				continue;
 
-			case '.': case ',': case ';': case '(': case ')': case '[': case ']': case '{': case '}': case ':':
-			{
-				int ch = l->curr;
+			case ',': case ';': case '(': case ')': case '[': case ']': case '{': case '}': case ':':
+			case '*': case '&':
+				l->lookahead = l->curr;
 				cparse_lex_push(s);
-				return l->lookahead = ch;
-			}
+				return l->lookahead;
+
+			case '.':
+				l->lookahead = l->curr;
+				cparse_lex_push(s);
+				if (l->curr < '0' || l->curr > '9')
+					return l->lookahead;
+				floating = true;
+
+			case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
+				break;
+
+			case 'c':
+				cparse_lex_push(s);
+				l->lookahead = CPARSE_TOK_IDENTIFIER;
+				if (cparse_lex_accept(s, "har"))
+				{
+					l->lookahead = CPARSE_KW_CHAR;
+				}
+				goto parse_identifier;
 
 			case 'd':
 				cparse_lex_push(s);
@@ -620,14 +648,9 @@ static const char* cparse_scan_token_string(struct cparse_state* s)
 }
 
 /* initialize functions */
-static void cparse_node_init(struct cparse_node* node, enum cparse_node_type type)
+static void cparse_decl_init(struct cparse_decl* decl, enum cparse_decl_kind type, const char* spelling)
 {
-	node->type = type;
-}
-
-static void cparse_node_decl_init(struct cparse_node_decl* decl, enum cparse_node_type type, const char* spelling)
-{
-	cparse_node_init(&decl->node, type);
+	decl->kind = type;
 	decl->spelling = spelling;
 	decl->next = NULL;
 }
@@ -636,42 +659,167 @@ static void cparse_node_decl_init(struct cparse_node_decl* decl, enum cparse_nod
 
 static struct cparse_type* cparse_parse_type(struct cparse_state* s)
 {
-	bool primitive_type = false;
 	bool primitive_signed = true;
-	
-	struct cparse_type_ref* ref = 
-
-	if (cparse_accept(s, CPARSE_KW_SIGNED)) {
-		primitive_type = true;
-	}
-	else if (cparse_accept(s, CPARSE_KW_UNSIGNED)) {
-		primitive_type = true;
-		primitive_signed = false;
-	}
-
-	struct cparse_type* 
+	enum cparse_type_primitive_kind primitive_kind = 0;
 
 	switch (s->lex.lookahead)
 	{
-		case CPARSE_KW_INT:
-			ret
-			break;
+		case CPARSE_KW_CHAR:
+			cparse_lex(s);
+			primitive_kind = CPARSE_PRIMITIVE_TYPE_CHAR;
+			goto set_primitive_type;
+
+		case CPARSE_KW_SIGNED:
+			cparse_lex(s);
+			goto parse_integral_primitive_type;
+
+		case CPARSE_KW_UNSIGNED:
+			cparse_lex(s);
+			primitive_signed = false;
+			goto parse_integral_primitive_type;
+
+		case CPARSE_KW_FLOAT:
+			cparse_lex(s);
+			primitive_kind = CPARSE_PRIMITIVE_TYPE_FLOAT;
+			goto set_primitive_type;
+
+		case CPARSE_KW_DOUBLE:
+			cparse_lex(s);
+			primitive_kind = CPARSE_PRIMITIVE_TYPE_DOUBLE;
+			goto set_primitive_type;
+
+		case CPARSE_KW_LONG:
+			cparse_lex(s);
+			if (cparse_accept(s, CPARSE_KW_DOUBLE)) {
+				cparse_lex(s);
+				primitive_kind = CPARSE_PRIMITIVE_TYPE_LONG_DOUBLE;
+				goto set_primitive_type;
+			}
+			goto long_keyword_parsed;
 
 		default:
 			break;
 	}
 
+parse_integral_primitive_type:
+	switch (s->lex.lookahead)
+	{
+		case CPARSE_KW_CHAR:
+			cparse_lex(s);
+			primitive_kind = primitive_signed ? CPARSE_PRIMITIVE_TYPE_SIGNED_CHAR : CPARSE_PRIMITIVE_TYPE_UNSIGNED_CHAR;
+			goto set_primitive_type;
+
+		case CPARSE_KW_SHORT:
+			cparse_lex(s);
+			primitive_kind = primitive_signed ? CPARSE_PRIMITIVE_TYPE_SIGNED_SHORT : CPARSE_PRIMITIVE_TYPE_UNSIGNED_SHORT;
+			cparse_accept(s, CPARSE_KW_INT);
+			goto set_primitive_type;
+
+		case CPARSE_KW_INT:
+			cparse_lex(s);
+			primitive_kind = primitive_signed ? CPARSE_PRIMITIVE_TYPE_SIGNED_INT : CPARSE_PRIMITIVE_TYPE_UNSIGNED_INT;
+			goto set_primitive_type;
+
+		case CPARSE_KW_LONG:
+			cparse_lex(s);
+		long_keyword_parsed:
+			primitive_kind = primitive_signed ? CPARSE_PRIMITIVE_TYPE_SIGNED_LONG : CPARSE_PRIMITIVE_TYPE_UNSIGNED_LONG;
+			if (cparse_accept(s, CPARSE_KW_LONG))
+				primitive_kind = primitive_signed ? CPARSE_PRIMITIVE_TYPE_SIGNED_LONG_LONG : CPARSE_PRIMITIVE_TYPE_UNSIGNED_LONG_LONG;
+			cparse_accept(s, CPARSE_KW_INT);
+			goto set_primitive_type;
+
+		set_primitive_type: {
+			struct cparse_type_primitive* primitive_type = cparse_alloc_type(s, struct cparse_type_primitive);
+			primitive_type->type.kind = CPARSE_TYPE_PRIMITIVE;
+			primitive_type->kind = primitive_kind;
+			return (struct cparse_type*)primitive_type;
+		}
+	}
+
+	cparse_error_syntax(s);
+	return NULL;
 }
 
-static struct cparse_node_decl_struct* cparse_parse_struct(struct cparse_state* s)
+static struct cparse_type* cparse_parse_type_ptr(struct cparse_state* s, struct cparse_type* type)
+{
+	while (cparse_accept(s, '*')) {
+		struct cparse_type_pointer* ptr_type = cparse_alloc_type(s, struct cparse_type_pointer);
+		ptr_type->type.kind = CPARSE_TYPE_POINTER;
+		ptr_type->pointee_type = type;
+		type = (struct cparse_type*)ptr_type;
+	}
+
+	return type;
+}
+
+static struct cparse_type* cparse_parse_type_array(struct cparse_state* s, struct cparse_type* type)
+{
+	while (cparse_accept(s, '['))
+	{
+		/* todo: this should be any static expression */
+		cparse_check(s, CPARSE_TOK_INTEGER);
+
+		struct cparse_type_array* array_type = cparse_alloc_type(s, struct cparse_type_array);
+		array_type->type.kind = CPARSE_TYPE_ARRAY;
+		array_type->element_type = type;
+		array_type->extent = atoi(s->lex.token_buffer);
+
+		cparse_lex(s); /* eat the extent */
+		cparse_expect(s, ']');
+
+		type = (struct cparse_type*)array_type;
+	}
+
+	return type;
+}
+
+//static struct cparse_decl** cparse_parse_variables(struct cparse_state* s, struct cparse_decl** pnext)
+//{
+//	struct cparse_type* base_type = cparse_parse_type(s);
+//	do
+//	{
+//		struct cparse_decl_variable_field* field = cparse_alloc_type(s, struct cparse_decl_variable_field);
+//		field->variable.type = cparse_parse_type_ptr(s, base_type);
+//		cparse_check(s, CPARSE_TOK_IDENTIFIER);
+//		cparse_decl_init(&field->variable.decl, CPARSE_DECL_FIELD, cparse_scan_token_string(s));
+//		field->variable.type = cparse_parse_type_array(s, field->variable.type);
+//		field->offset = 0;
+//		cparse_expect(s, ';');
+//		*pnext = (struct cparse_decl*)field;
+//		pnext = &field->variable.decl.next;
+//	} while (cparse_accept(s, ','));
+//	return pnext;
+//}
+
+static struct cparse_decl_struct* cparse_parse_struct(struct cparse_state* s)
 {
 	cparse_expect(s, CPARSE_KW_STRUCT);
 	cparse_check(s, CPARSE_TOK_IDENTIFIER);
 	
-	struct cparse_node_decl_struct* struct_decl = cparse_alloc_type(s, struct cparse_node_decl_struct);
-	cparse_node_decl_init(&struct_decl->decl, CPARSE_NODE_TYPE_DECL_STRUCT, cparse_scan_token_string(s));
+	struct cparse_decl_struct* struct_decl = cparse_alloc_type(s, struct cparse_decl_struct);
+	cparse_decl_init(&struct_decl->decl, CPARSE_DECL_STRUCT, cparse_scan_token_string(s));
 
 	cparse_expect(s, '{');
+
+	/* parse fields */
+	struct cparse_decl_variable_field** next_field = &struct_decl->fields;
+	while (!cparse_peek(s, '}')) {
+		struct cparse_type* base_type = cparse_parse_type(s);
+		do
+		{
+			struct cparse_decl_variable_field* field = cparse_alloc_type(s, struct cparse_decl_variable_field);
+			field->variable.type = cparse_parse_type_ptr(s, base_type);
+			cparse_check(s, CPARSE_TOK_IDENTIFIER);
+			cparse_decl_init(&field->variable.decl, CPARSE_DECL_FIELD, cparse_scan_token_string(s));
+			field->variable.type = cparse_parse_type_array(s, field->variable.type);
+			field->offset = 0;
+			cparse_expect(s, ';');
+			*next_field = field;
+			next_field = (struct cparse_decl_variable_field**)&field->variable.decl.next;
+		} while (cparse_accept(s, ','));
+	}
+
 	cparse_expect(s, '}');
 	cparse_expect(s, ';');
 
@@ -681,15 +829,15 @@ static struct cparse_node_decl_struct* cparse_parse_struct(struct cparse_state* 
 static struct cparse_unit* cparse_parse_unit(struct cparse_state* s)
 {
 	struct cparse_unit* unit = cparse_alloc_type(s, struct cparse_unit);
-	struct cparse_node_decl** last_next = &unit->decls;
+	struct cparse_decl** last_next = &unit->decls;
 
 	while (!cparse_peek(s, CPARSE_TOK_EOF))
 	{
-		struct cparse_node_decl* decl = NULL;
+		struct cparse_decl* decl = NULL;
 		switch (s->lex.lookahead)
 		{
 			case CPARSE_KW_STRUCT:
-				decl = (struct cparse_node_decl*)cparse_parse_struct(s);
+				decl = (struct cparse_decl*)cparse_parse_struct(s);
 				break;
 
 			default:
@@ -701,6 +849,30 @@ static struct cparse_unit* cparse_parse_unit(struct cparse_state* s)
 
 	return unit;
 }
+//
+//CPARSE_API void cparse_context_init(struct cparse_context* c)
+//{
+//	#define CPARSE_SET_PRIMITIVE_TYPE(id, spelling_)\
+//		c->primitive_types[CPARSE_PRIMITIVE_TYPE_##id].type.kind = CPARSE_TYPE_PRIMITIVE;\
+//		c->primitive_types[CPARSE_PRIMITIVE_TYPE_##id].spelling = spelling_;\
+//		c->primitive_types[CPARSE_PRIMITIVE_TYPE_##id].primitive_kind = CPARSE_PRIMITIVE_TYPE_##id
+//
+//	CPARSE_SET_PRIMITIVE_TYPE(CHAR, "char");
+//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_CHAR, "signed char");
+//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_CHAR, "unsigned char");
+//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_SHORT, "short");
+//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_SHORT, "unsigned short");
+//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_INT, "int");
+//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_INT, "unsigned int");
+//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_LONG, "long");
+//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_LONG, "unsigned long");
+//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_LONG_LONG, "long long");
+//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_LONG_LONG, "unsigned long long");
+//	CPARSE_SET_PRIMITIVE_TYPE(FLOAT, "float");
+//	CPARSE_SET_PRIMITIVE_TYPE(DOUBLE, "double");
+//
+//	#undef CPARSE_SET_PRIMITIVE_TYPE
+//}
 
 CPARSE_API enum cparse_result cparse_file(const char* filename, struct cparse_info const* info, struct cparse_unit** out)
 {
@@ -741,6 +913,51 @@ cleanup:
 	fclose(state.lex.file);
 	return result;
 }
+
+#ifndef CPARSE_NO_DUMP
+
+static void cparse_unit_dump_type(struct cparse_type* type, FILE* output)
+{
+	switch (type->kind)
+	{
+		case CPARSE_TYPE_PRIMITIVE:
+			fprintf(output, "%s", /*((struct cparse_type_primitive*)type)->spelling*/ "<todo>");
+			break;
+
+		case CPARSE_TYPE_POINTER:
+			cparse_unit_dump_type(((struct cparse_type_pointer*)type)->pointee_type, output);
+			fprintf(output, "*");
+			break;
+
+		default:
+			fprintf(output, "???");
+			break;
+	}
+}
+
+static void cparse_unit_dump_struct(struct cparse_decl_struct* struct_decl, FILE* output)
+{
+	fprintf(output, "struct (spelling=%s)\n", struct_decl->decl.spelling);
+	for (struct cparse_decl_variable_field* field = struct_decl->fields; field; field = (struct cparse_decl_variable_field*)field->variable.decl.next)
+	{
+		fprintf(output, "  field (spelling=\"%s\", type=\"", field->variable.spelling);
+		cparse_unit_dump_type(field->variable.type, output);
+		fprintf(output, "\")\n");
+	}
+}
+
+CPARSE_API void cparse_unit_dump(struct cparse_unit* unit, FILE* output)
+{
+	for (struct cparse_decl* decl = unit->decls; decl; decl = decl->next)
+	{
+		switch (decl->kind)
+		{
+			case CPARSE_DECL_STRUCT: cparse_unit_dump_struct((struct cparse_decl_struct*)decl, output); break;
+		}
+	}
+}
+
+#endif
 
 #undef cparse_alloc_type
 #undef uint
