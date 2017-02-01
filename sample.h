@@ -1,5 +1,5 @@
 
 struct foo {
-	long long* data2;
+	long long* data1;
 	long long int data2[10];
 };

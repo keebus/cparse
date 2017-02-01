@@ -96,7 +96,6 @@ struct cparse_decl {
 struct cparse_decl_variable {
 	struct cparse_decl decl;
 	struct cparse_type* type;
-	const char* spelling;
 };
 
 struct cparse_decl_variable_field {
@@ -120,6 +119,7 @@ struct cparse_info {
 	const char** defines; /* null or null terminated */
 };
 
+CPARSE_API const char*        cparse_primitive_type_spelling(enum cparse_type_primitive_kind);
 CPARSE_API enum cparse_result cparse_file(const char* filename, struct cparse_info const*, struct cparse_unit** out);
 
 #ifndef CPARSE_NO_DUMP
@@ -404,8 +404,6 @@ static cparse_token_t cparse_lex(struct cparse_state* s)
 	l->lookahead = CPARSE_TOK_EOF;
 	l->token_size = 0;
 
-	bool floating = false;
-
 	for (;;) {
 		switch (l->curr)
 		{
@@ -427,10 +425,29 @@ static cparse_token_t cparse_lex(struct cparse_state* s)
 				cparse_lex_push(s);
 				if (l->curr < '0' || l->curr > '9')
 					return l->lookahead;
-				floating = true;
+				goto parse_exponent;
 
 			case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
-				break;
+				cparse_lex_push(s);
+				for (;;) {
+					if (l->curr == '.') {
+						cparse_lex_push(s);
+						goto parse_exponent;
+					}
+					else if (l->curr >= '0' && l->curr <= '9') {
+						cparse_lex_push(s);
+					}
+					else {
+						break;
+					}
+				}
+				return l->lookahead = CPARSE_TOK_INTEGER;
+
+			parse_exponent:
+				while (l->curr >= '0' && l->curr <= '9') {
+					cparse_lex_push(s);
+				}
+				return l->lookahead = CPARSE_TOK_FLOAT;
 
 			case 'c':
 				cparse_lex_push(s);
@@ -774,24 +791,6 @@ static struct cparse_type* cparse_parse_type_array(struct cparse_state* s, struc
 	return type;
 }
 
-//static struct cparse_decl** cparse_parse_variables(struct cparse_state* s, struct cparse_decl** pnext)
-//{
-//	struct cparse_type* base_type = cparse_parse_type(s);
-//	do
-//	{
-//		struct cparse_decl_variable_field* field = cparse_alloc_type(s, struct cparse_decl_variable_field);
-//		field->variable.type = cparse_parse_type_ptr(s, base_type);
-//		cparse_check(s, CPARSE_TOK_IDENTIFIER);
-//		cparse_decl_init(&field->variable.decl, CPARSE_DECL_FIELD, cparse_scan_token_string(s));
-//		field->variable.type = cparse_parse_type_array(s, field->variable.type);
-//		field->offset = 0;
-//		cparse_expect(s, ';');
-//		*pnext = (struct cparse_decl*)field;
-//		pnext = &field->variable.decl.next;
-//	} while (cparse_accept(s, ','));
-//	return pnext;
-//}
-
 static struct cparse_decl_struct* cparse_parse_struct(struct cparse_state* s)
 {
 	cparse_expect(s, CPARSE_KW_STRUCT);
@@ -849,30 +848,31 @@ static struct cparse_unit* cparse_parse_unit(struct cparse_state* s)
 
 	return unit;
 }
-//
-//CPARSE_API void cparse_context_init(struct cparse_context* c)
-//{
-//	#define CPARSE_SET_PRIMITIVE_TYPE(id, spelling_)\
-//		c->primitive_types[CPARSE_PRIMITIVE_TYPE_##id].type.kind = CPARSE_TYPE_PRIMITIVE;\
-//		c->primitive_types[CPARSE_PRIMITIVE_TYPE_##id].spelling = spelling_;\
-//		c->primitive_types[CPARSE_PRIMITIVE_TYPE_##id].primitive_kind = CPARSE_PRIMITIVE_TYPE_##id
-//
-//	CPARSE_SET_PRIMITIVE_TYPE(CHAR, "char");
-//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_CHAR, "signed char");
-//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_CHAR, "unsigned char");
-//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_SHORT, "short");
-//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_SHORT, "unsigned short");
-//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_INT, "int");
-//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_INT, "unsigned int");
-//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_LONG, "long");
-//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_LONG, "unsigned long");
-//	CPARSE_SET_PRIMITIVE_TYPE(SIGNED_LONG_LONG, "long long");
-//	CPARSE_SET_PRIMITIVE_TYPE(UNSIGNED_LONG_LONG, "unsigned long long");
-//	CPARSE_SET_PRIMITIVE_TYPE(FLOAT, "float");
-//	CPARSE_SET_PRIMITIVE_TYPE(DOUBLE, "double");
-//
-//	#undef CPARSE_SET_PRIMITIVE_TYPE
-//}
+
+CPARSE_API const char* cparse_primitive_type_spelling(enum cparse_type_primitive_kind kind)
+{
+	#define CPARSE_PRIMITIVE_TYPE_STR(id, spelling)\
+		case CPARSE_PRIMITIVE_TYPE_##id: return spelling;
+
+	switch (kind) {
+		CPARSE_PRIMITIVE_TYPE_STR(CHAR, "char");
+		CPARSE_PRIMITIVE_TYPE_STR(SIGNED_CHAR, "signed char");
+		CPARSE_PRIMITIVE_TYPE_STR(UNSIGNED_CHAR, "unsigned char");
+		CPARSE_PRIMITIVE_TYPE_STR(SIGNED_SHORT, "short");
+		CPARSE_PRIMITIVE_TYPE_STR(UNSIGNED_SHORT, "unsigned short");
+		CPARSE_PRIMITIVE_TYPE_STR(SIGNED_INT, "int");
+		CPARSE_PRIMITIVE_TYPE_STR(UNSIGNED_INT, "unsigned int");
+		CPARSE_PRIMITIVE_TYPE_STR(SIGNED_LONG, "long");
+		CPARSE_PRIMITIVE_TYPE_STR(UNSIGNED_LONG, "unsigned long");
+		CPARSE_PRIMITIVE_TYPE_STR(SIGNED_LONG_LONG, "long long");
+		CPARSE_PRIMITIVE_TYPE_STR(UNSIGNED_LONG_LONG, "unsigned long long");
+		CPARSE_PRIMITIVE_TYPE_STR(FLOAT, "float");
+		CPARSE_PRIMITIVE_TYPE_STR(DOUBLE, "double");
+	}
+
+	#undef CPARSE_PRIMITIVE_TYPE_STR
+	return "???";
+}
 
 CPARSE_API enum cparse_result cparse_file(const char* filename, struct cparse_info const* info, struct cparse_unit** out)
 {
@@ -921,12 +921,17 @@ static void cparse_unit_dump_type(struct cparse_type* type, FILE* output)
 	switch (type->kind)
 	{
 		case CPARSE_TYPE_PRIMITIVE:
-			fprintf(output, "%s", /*((struct cparse_type_primitive*)type)->spelling*/ "<todo>");
+			fprintf(output, "%s", cparse_primitive_type_spelling(((struct cparse_type_primitive*)type)->kind));
 			break;
 
 		case CPARSE_TYPE_POINTER:
 			cparse_unit_dump_type(((struct cparse_type_pointer*)type)->pointee_type, output);
-			fprintf(output, "*");
+			fprintf(output, " *");
+			break;
+
+		case CPARSE_TYPE_ARRAY:
+			cparse_unit_dump_type(((struct cparse_type_array*)type)->element_type, output);
+			fprintf(output, " [%d]", ((struct cparse_type_array*)type)->extent);
 			break;
 
 		default:
@@ -940,7 +945,7 @@ static void cparse_unit_dump_struct(struct cparse_decl_struct* struct_decl, FILE
 	fprintf(output, "struct (spelling=%s)\n", struct_decl->decl.spelling);
 	for (struct cparse_decl_variable_field* field = struct_decl->fields; field; field = (struct cparse_decl_variable_field*)field->variable.decl.next)
 	{
-		fprintf(output, "  field (spelling=\"%s\", type=\"", field->variable.spelling);
+		fprintf(output, "field (offset=%d, spelling=\"%s\", type=\"", field->offset, field->variable.decl.spelling);
 		cparse_unit_dump_type(field->variable.type, output);
 		fprintf(output, "\")\n");
 	}
