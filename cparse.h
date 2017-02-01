@@ -22,7 +22,8 @@ enum cparse_result {
 	CPARSE_RESULT_OK,
 	CPARSE_RESULT_OUT_OF_MEMORY,
 	CPARSE_RESULT_INVALID_INPUT_FILE,
-	CPARSE_RESULT_SYNTAX_ERROR
+	CPARSE_RESULT_SYNTAX_ERROR,
+	CPARSE_RESULT_SEMANTIC_ERROR,
 };
 
 enum cparse_type_kind {
@@ -52,13 +53,30 @@ enum cparse_type_primitive_kind {
 };
 
 enum cparse_decl_kind {
+	CPARSE_DECL_INVALID,
+	CPARSE_DECL_ENUM_CONSTANT,
+	CPARSE_DECL_ENUM,
 	CPARSE_DECL_VARIABLE,
 	CPARSE_DECL_FIELD,
 	CPARSE_DECL_STRUCT,
 };
 
+enum cparse_storage_class {
+	CPARSE_STORAGE_CLASS_DEFAULT = 0,
+	CPARSE_STORAGE_CLASS_EXTERN = 1,
+	CPARSE_STORAGE_CLASS_STATIC = 2,
+	CPARSE_STORAGE_CLASS_INLINE = 4,
+};
+
+enum cparse_type_qualifier {
+	CPARSE_TYPE_QUAL_NONE = 0, 
+	CPARSE_TYPE_QUAL_CONST = 1,
+	CPARSE_TYPE_QUAL_VOLATILE = 2,
+};
+
 struct cparse_type {
 	enum cparse_type_kind kind;
+	enum cparse_type_qualifier qualifiers;
 };
 
 struct cparse_type_primitive {
@@ -93,6 +111,17 @@ struct cparse_decl {
 	const char* spelling;
 };
 
+struct cparse_decl_enum_constant {
+	struct cparse_decl decl;
+	long long value;
+};
+
+struct cparse_decl_enum {
+	struct cparse_decl decl;
+	int num_constants;
+	struct cparse_decl_enum_constant* constants;
+};
+
 struct cparse_decl_variable {
 	struct cparse_decl decl;
 	struct cparse_type* type;
@@ -105,6 +134,7 @@ struct cparse_decl_variable_field {
 
 struct cparse_decl_struct {
 	struct cparse_decl decl;
+	int num_fields;
 	struct cparse_decl_variable_field* fields;
 };
 
@@ -148,6 +178,7 @@ CPARSE_API void cparse_unit_dump(struct cparse_unit*, FILE* output);
 #include <string.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <assert.h>
 
 static int cparse_min(int a, int b) { return a < b ? a : b;}
 
@@ -156,6 +187,7 @@ static int cparse_min(int a, int b) { return a < b ? a : b;}
 	_(TOK_INTEGER, "integer literal")\
 	_(TOK_IDENTIFIER, "identifier")\
 	_(KW_CHAR, "char")\
+	_(KW_CONST, "const")\
 	_(KW_DO, "do")\
 	_(KW_DOUBLE, "double")\
 	_(KW_ELSE, "else")\
@@ -187,27 +219,6 @@ typedef int cparse_token_t;
 #undef CPARSE_MAKE_TOKEN_ENUM
 #define CPARSE_MAKE_TOKEN_STR(id, str) case CPARSE_##id: return str;
 
-static const char* cparse_strtok(cparse_token_t tok)
-{
-	switch (tok)
-	{
-		case CPARSE_TOK_EOF: return "end-of-file";
-		CPARSE_TOKENS(CPARSE_MAKE_TOKEN_STR)
-		
-		default:
-		{
-			static union {
-				int tok;
-				char chars[8];
-			} helper;
-			helper.tok = tok;
-			return helper.chars;
-		}
-	}
-}
-
-#undef CPARSE_MAKE_TOKEN_STR
-#undef CPARSE_TOKENS
 
 struct cparse_lexer {
 	FILE* file;
@@ -230,6 +241,41 @@ struct cparse_state {
 	char const* error;
 	struct cparse_lexer lex;
 };
+
+static const char* cparse_strtok(cparse_token_t tok)
+{
+	switch (tok)
+	{
+		case CPARSE_TOK_EOF: return "end-of-file";
+			CPARSE_TOKENS(CPARSE_MAKE_TOKEN_STR)
+
+		default:
+			{
+				static union
+				{
+					int tok;
+					char chars[8];
+				} helper;
+				helper.tok = tok;
+				return helper.chars;
+			}
+	}
+}
+
+static struct cparse_decl* cparse_decl_find(struct cparse_decl* first, const char* spelling)
+{
+	for (struct cparse_decl* decl = first; decl; decl = decl->next)
+		if (strcmp(decl->spelling, spelling) == 0)
+			return decl;
+	return NULL;
+}
+
+static struct cparse_decl_variable_field* cparse_struct_find_field(struct cparse_decl_struct* s, const char* spelling)
+{
+	struct cparse_decl* decl = cparse_decl_find((struct cparse_decl*)s->fields, spelling);
+	assert(!decl || decl->kind == CPARSE_DECL_FIELD);
+	return (struct cparse_decl_variable_field*)decl;
+}
 
 static size_t cparse_formatv(char* buffer, size_t buffer_size, const char* format, va_list args)
 {
@@ -346,12 +392,12 @@ static void* cparse_alloc(struct cparse_state* s, cparse_size_t size, uint align
 static int cparse_lex_skip(struct cparse_state* s)
 {
 	struct cparse_lexer* l = &s->lex;
-	l->curr = fgetc(l->file);
-	++l->column;
+	++l->column; 
 	if (l->curr == '\n') {
-		l->column = 1;
+		l->column = 0;
 		++l->line;
 	}
+	l->curr = fgetc(l->file);
 	return l->curr;
 }
 
@@ -452,9 +498,16 @@ static cparse_token_t cparse_lex(struct cparse_state* s)
 			case 'c':
 				cparse_lex_push(s);
 				l->lookahead = CPARSE_TOK_IDENTIFIER;
-				if (cparse_lex_accept(s, "har"))
+				if (cparse_lex_accept_c(s, 'h'))
 				{
-					l->lookahead = CPARSE_KW_CHAR;
+					if (cparse_lex_accept(s, "ar"))
+					{
+						l->lookahead = CPARSE_KW_CHAR;
+					}
+				}
+				else if (cparse_lex_accept(s, "onst"))
+				{
+					l->lookahead = CPARSE_KW_CONST;
 				}
 				goto parse_identifier;
 
@@ -674,10 +727,24 @@ static void cparse_decl_init(struct cparse_decl* decl, enum cparse_decl_kind typ
 
 /* parsing functions */
 
+static enum cparse_type_qualifier cparse_parse_type_qualifiers(struct cparse_state* s)
+{
+	enum cparse_type_qualifier qualifiers = CPARSE_TYPE_QUAL_NONE;
+	for (;;) {
+		switch (s->lex.lookahead) {
+			case CPARSE_KW_CONST: qualifiers |= CPARSE_TYPE_QUAL_CONST; break;
+			case CPARSE_KW_VOLATILE: qualifiers |= CPARSE_TYPE_QUAL_VOLATILE; break;
+			default: return qualifiers;
+		}
+		cparse_lex(s);
+	}
+}
+
 static struct cparse_type* cparse_parse_type(struct cparse_state* s)
 {
 	bool primitive_signed = true;
 	enum cparse_type_primitive_kind primitive_kind = 0;
+	enum cparse_parse_type_qualifiers qualifier = cparse_parse_type_qualifiers(s);
 
 	switch (s->lex.lookahead)
 	{
@@ -749,6 +816,7 @@ parse_integral_primitive_type:
 		set_primitive_type: {
 			struct cparse_type_primitive* primitive_type = cparse_alloc_type(s, struct cparse_type_primitive);
 			primitive_type->type.kind = CPARSE_TYPE_PRIMITIVE;
+			primitive_type->type.qualifiers = qualifier | cparse_parse_type_qualifiers(s);
 			primitive_type->kind = primitive_kind;
 			return (struct cparse_type*)primitive_type;
 		}
@@ -763,6 +831,7 @@ static struct cparse_type* cparse_parse_type_ptr(struct cparse_state* s, struct 
 	while (cparse_accept(s, '*')) {
 		struct cparse_type_pointer* ptr_type = cparse_alloc_type(s, struct cparse_type_pointer);
 		ptr_type->type.kind = CPARSE_TYPE_POINTER;
+		ptr_type->type.qualifiers = cparse_parse_type_qualifiers(s);
 		ptr_type->pointee_type = type;
 		type = (struct cparse_type*)ptr_type;
 	}
@@ -779,6 +848,7 @@ static struct cparse_type* cparse_parse_type_array(struct cparse_state* s, struc
 
 		struct cparse_type_array* array_type = cparse_alloc_type(s, struct cparse_type_array);
 		array_type->type.kind = CPARSE_TYPE_ARRAY;
+		array_type->type.qualifiers = CPARSE_TYPE_QUAL_NONE;
 		array_type->element_type = type;
 		array_type->extent = atoi(s->lex.token_buffer);
 
@@ -791,17 +861,68 @@ static struct cparse_type* cparse_parse_type_array(struct cparse_state* s, struc
 	return type;
 }
 
-static struct cparse_decl_struct* cparse_parse_struct(struct cparse_state* s)
+static struct cparse_decl_enum* cpase_parse_enum(struct cparse_state* s, struct cparse_decl*** parent_decls)
 {
-	cparse_expect(s, CPARSE_KW_STRUCT);
-	cparse_check(s, CPARSE_TOK_IDENTIFIER);
-	
-	struct cparse_decl_struct* struct_decl = cparse_alloc_type(s, struct cparse_decl_struct);
-	cparse_decl_init(&struct_decl->decl, CPARSE_DECL_STRUCT, cparse_scan_token_string(s));
+	cparse_expect(s, CPARSE_KW_ENUM);
+
+	struct cparse_decl_enum* enum_decl = cparse_alloc_type(s, struct cparse_decl_enum);
+	cparse_decl_init(&enum_decl->decl, CPARSE_DECL_ENUM, NULL);
+	enum_decl->constants = NULL;
+	enum_decl->num_constants = 0;
+
+	if (cparse_peek(s, CPARSE_TOK_IDENTIFIER)) {
+		enum_decl->decl.spelling = cparse_scan_token_string(s);
+		**parent_decls = (struct cparse_decl*)enum_decl;
+		*parent_decls = &enum_decl->decl.next;
+	}
 
 	cparse_expect(s, '{');
 
-	/* parse fields */
+	long long int value = 0;
+
+	struct cparse_decl_enum_constant** next_constant = &enum_decl->constants;
+	while (!cparse_accept(s, '}')) {
+		cparse_check(s, CPARSE_TOK_IDENTIFIER);
+		struct cparse_decl_enum_constant* constant = cparse_alloc_type(s, struct cparse_decl_enum_constant);
+		cparse_decl_init(&constant->decl, CPARSE_DECL_ENUM_CONSTANT, cparse_scan_token_string(s));
+
+		if (cparse_decl_find((struct cparse_decl*)enum_decl->constants, constant->decl.spelling))
+			cparse_error(s, CPARSE_RESULT_SEMANTIC_ERROR, "duplicate enum constant '%s'.", constant->decl.spelling);
+
+		if (cparse_accept(s, '=')) {
+			cparse_check(s, CPARSE_TOK_INTEGER);
+			value = atoi(s->lex.token_buffer);
+		}
+
+		constant->value = value++;
+		++enum_decl->num_constants;
+
+		cparse_accept(s, ',');
+
+		*next_constant = constant;
+		next_constant = (struct cparse_decl_enum_constant**)&constant->decl.next;
+	}
+
+	return enum_decl;
+}
+
+static struct cparse_decl_struct* cparse_parse_struct(struct cparse_state* s, struct cparse_decl*** parent_decls)
+{
+	cparse_expect(s, CPARSE_KW_STRUCT);
+	
+	struct cparse_decl_struct* struct_decl = cparse_alloc_type(s, struct cparse_decl_struct);
+	cparse_decl_init(&struct_decl->decl, CPARSE_DECL_STRUCT, NULL);
+	struct_decl->fields = NULL;
+	struct_decl->num_fields = 0;
+
+	if (cparse_peek(s, CPARSE_TOK_IDENTIFIER)) {
+		struct_decl->decl.spelling = cparse_scan_token_string(s);
+		**parent_decls = (struct cparse_decl*)struct_decl;
+		*parent_decls = &struct_decl->decl.next;
+	}
+	
+	cparse_expect(s, '{');
+
 	struct cparse_decl_variable_field** next_field = &struct_decl->fields;
 	while (!cparse_peek(s, '}')) {
 		struct cparse_type* base_type = cparse_parse_type(s);
@@ -811,16 +932,21 @@ static struct cparse_decl_struct* cparse_parse_struct(struct cparse_state* s)
 			field->variable.type = cparse_parse_type_ptr(s, base_type);
 			cparse_check(s, CPARSE_TOK_IDENTIFIER);
 			cparse_decl_init(&field->variable.decl, CPARSE_DECL_FIELD, cparse_scan_token_string(s));
+
+			if (cparse_struct_find_field(struct_decl, field->variable.decl.spelling))
+				cparse_error(s, CPARSE_RESULT_SEMANTIC_ERROR, "duplicate struct field '%s'.", field->variable.decl.spelling);
+
 			field->variable.type = cparse_parse_type_array(s, field->variable.type);
 			field->offset = 0;
+			++struct_decl->num_fields;
 			cparse_expect(s, ';');
+
 			*next_field = field;
 			next_field = (struct cparse_decl_variable_field**)&field->variable.decl.next;
 		} while (cparse_accept(s, ','));
 	}
 
 	cparse_expect(s, '}');
-	cparse_expect(s, ';');
 
 	return struct_decl;
 }
@@ -832,18 +958,21 @@ static struct cparse_unit* cparse_parse_unit(struct cparse_state* s)
 
 	while (!cparse_peek(s, CPARSE_TOK_EOF))
 	{
-		struct cparse_decl* decl = NULL;
 		switch (s->lex.lookahead)
 		{
+			case CPARSE_KW_ENUM:
+				cpase_parse_enum(s, &last_next);
+				cparse_expect(s, ';');
+				break;
+
 			case CPARSE_KW_STRUCT:
-				decl = (struct cparse_decl*)cparse_parse_struct(s);
+				cparse_parse_struct(s, &last_next);
+				cparse_expect(s, ';');
 				break;
 
 			default:
 				cparse_error_syntax(s);
 		}
-		*last_next = decl;
-		last_next = &decl->next;
 	}
 
 	return unit;
@@ -938,6 +1067,20 @@ static void cparse_unit_dump_type(struct cparse_type* type, FILE* output)
 			fprintf(output, "???");
 			break;
 	}
+
+	if (type->qualifiers & CPARSE_TYPE_QUAL_CONST)
+		fprintf(output, " const");
+	if (type->qualifiers & CPARSE_TYPE_QUAL_VOLATILE)
+		fprintf(output, " volatile");
+}
+
+static void cparse_unit_dump_enum(struct cparse_decl_enum* enum_decl, FILE* output)
+{
+	fprintf(output, "enum (spelling=%s)\n", enum_decl->decl.spelling);
+	for (struct cparse_decl_enum_constant* constant = enum_decl->constants; constant; constant = (struct cparse_decl_enum_constant*)constant->decl.next)
+	{
+		fprintf(output, "\tconstant (spelling=\"%s\", value=\"%lld\")\n", constant->decl.spelling, constant->value);
+	}
 }
 
 static void cparse_unit_dump_struct(struct cparse_decl_struct* struct_decl, FILE* output)
@@ -945,7 +1088,7 @@ static void cparse_unit_dump_struct(struct cparse_decl_struct* struct_decl, FILE
 	fprintf(output, "struct (spelling=%s)\n", struct_decl->decl.spelling);
 	for (struct cparse_decl_variable_field* field = struct_decl->fields; field; field = (struct cparse_decl_variable_field*)field->variable.decl.next)
 	{
-		fprintf(output, "field (offset=%d, spelling=\"%s\", type=\"", field->offset, field->variable.decl.spelling);
+		fprintf(output, "\tfield (offset=%d, spelling=\"%s\", type=\"", field->offset, field->variable.decl.spelling);
 		cparse_unit_dump_type(field->variable.type, output);
 		fprintf(output, "\")\n");
 	}
@@ -957,6 +1100,7 @@ CPARSE_API void cparse_unit_dump(struct cparse_unit* unit, FILE* output)
 	{
 		switch (decl->kind)
 		{
+			case CPARSE_DECL_ENUM: cparse_unit_dump_enum((struct cparse_decl_enum*)decl, output); break;
 			case CPARSE_DECL_STRUCT: cparse_unit_dump_struct((struct cparse_decl_struct*)decl, output); break;
 		}
 	}
@@ -964,6 +1108,8 @@ CPARSE_API void cparse_unit_dump(struct cparse_unit* unit, FILE* output)
 
 #endif
 
+#undef CPARSE_MAKE_TOKEN_STR
+#undef CPARSE_TOKENS
 #undef cparse_alloc_type
 #undef uint
 #undef true

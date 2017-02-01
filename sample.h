@@ -1,5 +1,9 @@
+enum my_enum {
+	VALUE_1,
+	VALUE_2,
+};
 
 struct foo {
-	long long* data1;
-	long long int data2[10];
+	const char* data1;
+	const char* data2;
 };
